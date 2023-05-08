@@ -1,40 +1,48 @@
 import torch
 from torch import nn
 from transformers import AutoModel
+import pytorch_lightning as pl
+from sklearn.metrics import accuracy_score
 
-MODEL_NAME = "cointegrated/rubert-tiny2"
 
+class ManipulationTargetLightningModel(pl.LightningModule):
 
-class ComplexModel(nn.Module):
-    def __init__(self, bert_model_name):
-        super(ComplexModel, self).__init__()
+    def __init__(self, bert_model_name: str, optimizer, lr: float, freeze_bert: bool, loss_function):
+        super().__init__()
         self.bert = AutoModel.from_pretrained(bert_model_name)
+        self.head = nn.Linear(self.bert.config.hidden_size, 2)
+        self.lr = lr
+        self.optimizer = optimizer
+        self.loss_function = loss_function
+        if freeze_bert: 
+            self.freeze_bert()
 
-        self.manipulation_dense = nn.Linear(self.bert.config.hidden_size, 37)
-        self.RE_bilin1 = nn.Bilinear(
-            self.bert.config.hidden_size,
-            self.bert.config.hidden_size,
-            512
-        )
-        self.RE_relu = nn.ReLU()
-        self.RE_lin1 = nn.Linear(512, 512)
-        self.RE_sigmoid = nn.Sigmoid()
+    def freeze_bert(self):
+        for parameter in self.bert.parameters():
+            parameter.requires_grad = False
 
-    # maniputalion detection part
-    def _manipulation_forward(self, bert_output):
-        return self.manipulation_dense(bert_output)
+    def forward(self, input_ids):
+        bert_output = self.bert(input_ids)
+        connection_output = self.head(bert_output.last_hidden_state)
 
-    # relation extraction part
-    def _connections_forward(self, bert_output):
-        h = self.RE_bilin1(bert_output, bert_output)
-        h = self.RE_relu(h)
-        h = self.RE_lin1(h)
-        connection_output = self.RE_sigmoid(h)
         return connection_output
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
-        bert_output, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, return_dict=False)
-        manipulation_output = self._manipulation_forward(bert_output)
-        connection_output = self._connections_forward(bert_output)
+    def configure_optimizers(self):
+        return self.optimizer(self.parameters(), lr=self.lr)
 
-        return manipulation_output, connection_output
+    def training_step(self, train_batch, batch_idx):
+        x, y = train_batch 
+        y_hat = self(x)
+        y_hat = y_hat.transpose(1, 2)
+        loss = self.loss_function(y_hat, y)
+        self.log('train_loss', loss, prog_bar=True, logger=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch 
+        y_hat = self(x)
+        y_hat = y_hat.transpose(1, 2)
+        loss = self.loss_function(y_hat, y)
+        accuracy = accuracy_score(y.cpu().flatten(), y_hat.argmax(-2).cpu().flatten())
+        self.log('val_loss', loss, prog_bar=True, logger=True)
+        self.log('val_accuracy', accuracy, prog_bar=True, logger=True)

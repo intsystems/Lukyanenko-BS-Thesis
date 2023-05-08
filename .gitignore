@@ -120,3 +120,8 @@ logs/
 */mnist
 *.csv
 !.dvc
+
+lightning_logs/
+*~
+
+data/

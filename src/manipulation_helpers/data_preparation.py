@@ -175,7 +175,7 @@ def encode_tags(
     encoded_labels = []
     for i, doc_labels in enumerate(labels):
         word_ids = encodings.word_ids(i)
-        aligned_labels = [-100 if i is None else doc_labels[i] for i in word_ids]
+        aligned_labels = [-100 if idx is None else doc_labels[idx] for idx in word_ids]
         encoded_labels.append(aligned_labels)
     return encoded_labels
 
@@ -241,36 +241,35 @@ class ManipulationDataset(Dataset):
         (для того, чтобы унифицировать кол-во связей для обучения по батчам)
     """
 
-    def __init__(self, encodings, labels, connections, connections_ans, sample_size_of_connections=256):
-        self.encodings = encodings
-        self.labels = labels
-        self.connections = connections
-        self.connections_ans = connections_ans
-        self.connections_matrices = self.generate_connection_matrices(
-            connections, connections_ans, encodings["attention_mask"]
-        )
-        self.sample_size_of_connections = sample_size_of_connections
+    def __init__(self, encodings, labels=None, connections=None, connections_ans=None, inference=False):
+        self.inference = inference
+        if self.inference:
+            self.encodings = encodings
+        else:
+            self.encodings = encodings
+            self.labels = labels
+            self.connections = connections
+            self.connections_ans = connections_ans
+            self.connections_matrices = self.generate_connection_matrices(
+                connections, connections_ans, encodings["attention_mask"]
+            )
 
     def __getitem__(self, idx):
-
-        connection_ids = np.ones((4, len(self.connections_ans[idx])), dtype=int)
-        connection_ids[0] = np.array(self.connections[idx]['man_id_start'])
-        connection_ids[1] = np.array(self.connections[idx]['man_id_end'])
-        connection_ids[2] = np.array(self.connections[idx]['ent_id_start'])
-        connection_ids[3] = np.array(self.connections[idx]['ent_id_end'])
-        connection_ans = np.array(self.connections_ans[idx])
-
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
-        labels = torch.tensor(self.labels[idx])
-        connections = torch.Tensor(connection_ids)
-        connections_ans = torch.Tensor(connection_ans).to(torch.long)
-        connections_matrix = torch.Tensor(self.connections_matrices[idx])
-        input_ids = item['input_ids']
-        attention_mask = item['attention_mask']
-        return input_ids, attention_mask, labels, connections_matrix[:256, :256]
+        if self.inference:
+            item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+            input_ids = item['input_ids']
+            attention_mask = item['attention_mask']
+            return input_ids, attention_mask
+        else:
+            item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+            labels = torch.tensor(self.labels[idx])
+            connections_matrix = torch.Tensor(self.connections_matrices[idx])
+            input_ids = item['input_ids']
+            attention_mask = item['attention_mask']
+            return input_ids, attention_mask, labels, connections_matrix
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.encodings['input_ids'])
 
     @staticmethod
     def generate_connection_matrices(connections, connections_ans, attention_masks):
@@ -288,10 +287,7 @@ class ManipulationDataset(Dataset):
             connection_ids[3] = np.array(connection['ent_id_end'])
             connection = connection_ids
             sentence_len = (attention_mask == 1).sum()
-            connection_matrix = torch.ones((len(attention_mask), len(attention_mask))) * -1
-            connection_matrix[:sentence_len, :sentence_len] = torch.zeros(
-                (sentence_len, sentence_len)
-            )
+            connection_matrix = torch.zeros((len(attention_mask), len(attention_mask)))
             if len(connection_ans) == 0:
                 connections_matrices.append(connection_matrix)
                 continue
@@ -308,3 +304,36 @@ class ManipulationDataset(Dataset):
                                int(ent_id_end.item()) - int(ent_id_start.item()) + 1)
             connections_matrices.append(connection_matrix)
         return connections_matrices
+
+
+def create_concat_data(step_encodings, step_entities, step_manipulation_targets, encoded_sep_token, max_length: int = 512):
+    
+    data = []
+    step_relation_labels = []
+    
+    for encodings, entities, manipulation_targets in zip(step_encodings['input_ids'], 
+                                                         step_entities, 
+                                                         step_manipulation_targets):
+        samples = []
+        relation_labels = []
+        encodings, entities, manipulation_targets =\
+                np.array(encodings), np.array(entities), np.array(manipulation_targets)
+
+        if max(manipulation_targets) == 0:
+            if max(entities) == 0:
+                continue
+            sample = list(encodings[entities == np.random.choice([i for i in range(1, max(entities) + 1)])]) +\
+                    [encoded_sep_token] + list(encodings)
+            relation_label = [0 for _ in entities] + [0] + list(manipulation_targets)
+            samples.append(sample[:max_length])
+            relation_labels.append(relation_label[:max_length])
+        else:
+            for manipulation_target in range(1, max(manipulation_targets) + 1): 
+                sample = list(encodings[entities == manipulation_target]) + [encoded_sep_token] + list(encodings)
+                relation_label = [0 for _ in entities] + [0] + \
+                        list((manipulation_targets == manipulation_target).astype(int))
+                samples.append(sample[:max_length])
+                relation_labels.append(relation_label[:max_length])
+        data += samples
+        step_relation_labels += relation_labels
+    return data, step_relation_labels
