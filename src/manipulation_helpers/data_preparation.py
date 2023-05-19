@@ -3,6 +3,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import json
 import re
 from itertools import product
+from collections import defaultdict
 
 import pandas as pd
 import spacy
@@ -163,7 +164,7 @@ def encode_tags(
     """
     Выравнивание разметки слов с токенами трансформера
     """
-    assert target_column in {"manipulation_class", "entity_id", "manipulation_target"}
+    assert target_column in {"manipulation_class", "entity_id", "manipulation_target", "bio_span"}
 
     if target_column == "manipulation_class":
         labels = [[tag2id[tag.manipulation_class] for tag in doc] for doc in tags]
@@ -171,6 +172,8 @@ def encode_tags(
         labels = [[x.entity_id for x in row] for row in tags]
     elif target_column == "manipulation_target":
         labels = [[x.manipulation_target for x in row] for row in tags]
+    elif target_column == "bio_span":
+        labels = [[tag2id[tag.manipulation_class[0]] for tag in doc] for doc in tags]
 
     encoded_labels = []
     for i, doc_labels in enumerate(labels):
@@ -306,34 +309,105 @@ class ManipulationDataset(Dataset):
         return connections_matrices
 
 
-def create_concat_data(step_encodings, step_entities, step_manipulation_targets, encoded_sep_token, max_length: int = 512):
-    
-    data = []
-    step_relation_labels = []
-    
-    for encodings, entities, manipulation_targets in zip(step_encodings['input_ids'], 
-                                                         step_entities, 
-                                                         step_manipulation_targets):
-        samples = []
-        relation_labels = []
-        encodings, entities, manipulation_targets =\
-                np.array(encodings), np.array(entities), np.array(manipulation_targets)
+def get_spans(span):
+    start_ids = np.where(span == 2)[0]
+    for start_id in start_ids:
+        spn = [0 for _ in range(start_id)] + [1]
+        for i, token in enumerate(span[start_id + 1:]):
+            if token == 0 or token == 2:
+                spn += [0 for _ in range(512 - i - start_id - 1)]
+                yield np.array(spn)
+                break
+            spn.append(1)
 
-        if max(manipulation_targets) == 0:
-            if max(entities) == 0:
-                continue
-            sample = list(encodings[entities == np.random.choice([i for i in range(1, max(entities) + 1)])]) +\
-                    [encoded_sep_token] + list(encodings)
-            relation_label = [0 for _ in entities] + [0] + list(manipulation_targets)
-            samples.append(sample[:max_length])
-            relation_labels.append(relation_label[:max_length])
+    
+def create_span_targeting_data(encodings, entities, manipulation_targets, spans, encoded_cls_token, 
+                               max_length_text: int = 512, max_length_entity: int = 64, max_length_span: int = 256):
+    
+    new_entities = []
+    new_spans = []
+    new_full_texts = []
+    new_labels = []
+
+    for encodings, entities, targets, span in zip(encodings['input_ids'], 
+                                                  entities, 
+                                                  manipulation_targets,
+                                                  spans):
+      
+        encodings, entities, targets, span =\
+                np.array(encodings), np.array(entities), np.array(targets), np.array(span)
+
+        if max(entities) == 0: # (когда нет НЕРа - уходим)
+            continue
+        
         else:
-            for manipulation_target in range(1, max(manipulation_targets) + 1): 
-                sample = list(encodings[entities == manipulation_target]) + [encoded_sep_token] + list(encodings)
-                relation_label = [0 for _ in entities] + [0] + \
-                        list((manipulation_targets == manipulation_target).astype(int))
-                samples.append(sample[:max_length])
-                relation_labels.append(relation_label[:max_length])
-        data += samples
-        step_relation_labels += relation_labels
-    return data, step_relation_labels
+            if max(targets) == 0: # (когда нет связанных фрагментов)
+                if max(span) == 0: # (когда только НЕРы тоже уходим)
+                    continue
+                else: # (когда есть фрагменты манипуляции и есть НЕРы, но они не связаны -> рандомим)
+                    
+                    entity = np.random.randint(1, max(entities) + 1)
+                    for span_ in get_spans(span):
+                        new_full_texts.append(
+                            [encoded_cls_token] + list(encodings)[:-1]
+                        )
+                        new_entities.append(
+                            [encoded_cls_token] + \
+                            list(encodings[entities == entity]) + \
+                            [0 for _ in range(max_length_entity - (entities == entity).sum())]
+                        )
+                        new_spans.append(
+                            [encoded_cls_token] + \
+                            list(encodings[span_ == 1]) + \
+                            [0 for _ in range(max_length_span - (span_ == 1).sum())]
+                        )
+                        new_labels.append(0)
+                            
+            else: # (когда есть связанные фрагменты)
+                for entity in np.unique(targets):
+                    if entity <= 0:
+                        continue
+                    new_full_texts.append(
+                        [encoded_cls_token] + list(encodings)[:-1]
+                    )
+                    new_entities.append(
+                        [encoded_cls_token] + \
+                        list(encodings[entities == entity]) + \
+                        [0 for _ in range(max_length_entity - (entities == entity).sum())]
+                    )
+                    new_spans.append(
+                        [encoded_cls_token] + \
+                        list(encodings[targets == entity]) + \
+                        [0 for _ in range(max_length_span - (targets == entity).sum())]
+                    )
+                    new_labels.append(1)
+
+    print(f'% of positive class {sum(new_labels) / len(new_labels)}')
+    return new_full_texts, new_entities, new_spans, new_labels
+
+
+class SpanTargetingDataset(Dataset):
+    """
+    Класс датасета для задачи манипуляции.
+        Параметр sample_size_of_connections отвечает за количество семплируемых connections
+        (для того, чтобы унифицировать кол-во связей для обучения по батчам)
+    """
+
+    def __init__(self, full_texts, spans, entities, labels):
+        
+        self.full_texts = full_texts
+        self.spans = spans
+        self.entities = entities 
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        
+        full_text_ids = torch.tensor(self.full_texts[idx])
+        span_ids = torch.tensor(self.spans[idx])
+        entity_ids = torch.tensor(self.entities[idx])
+        label = torch.tensor(self.labels[idx])
+        
+        return full_text_ids, entity_ids, span_ids, label
+        
+    def __len__(self):
+        return len(self.labels)
