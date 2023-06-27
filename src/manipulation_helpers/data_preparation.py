@@ -164,7 +164,7 @@ def encode_tags(
     """
     Выравнивание разметки слов с токенами трансформера
     """
-    assert target_column in {"manipulation_class", "entity_id", "manipulation_target", "bio_span"}
+    assert target_column in {"manipulation_class", "entity_id", "manipulation_target", "bio_span", "eng"}
 
     if target_column == "manipulation_class":
         labels = [[tag2id[tag.manipulation_class] for tag in doc] for doc in tags]
@@ -174,6 +174,8 @@ def encode_tags(
         labels = [[x.manipulation_target for x in row] for row in tags]
     elif target_column == "bio_span":
         labels = [[tag2id[tag.manipulation_class[0]] for tag in doc] for doc in tags]
+    elif target_column == "eng":
+        labels = tags
 
     encoded_labels = []
     for i, doc_labels in enumerate(labels):
@@ -377,7 +379,7 @@ def create_span_targeting_data(encodings, entities, manipulation_targets, spans,
                     )
                     new_spans.append(
                         [encoded_cls_token] + \
-                        list(encodings[targets == entity]) + \
+                        list(encodings[targets == entity])[:max_length_span] + \
                         [0 for _ in range(max_length_span - (targets == entity).sum())]
                     )
                     new_labels.append(1)
@@ -406,7 +408,6 @@ class SpanTargetingDataset(Dataset):
         span_ids = torch.tensor(self.spans[idx])
         entity_ids = torch.tensor(self.entities[idx])
         label = torch.tensor(self.labels[idx])
-        
         return full_text_ids, entity_ids, span_ids, label
         
     def __len__(self):

@@ -4,59 +4,56 @@ from torch import nn
 from transformers import AutoModel
 import pytorch_lightning as pl
 from sklearn.metrics import accuracy_score, precision_score, recall_score
+from peft import get_peft_config, PeftModel, PeftConfig, get_peft_model, LoraConfig, TaskType
 
 
 class SILitModel(pl.LightningModule):
 
     def __init__(self, bert_model_name: str, optimizer, lr: float, freeze_bert: bool, 
-                 loss_function, output_size: int, scheduler=None, random_refreeze: bool = False):
+                 loss_function, output_size: int, scheduler=None, freeze_all: bool = False, lora: bool = False):
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_model_name)
+        if lora:
+            peft_config = LoraConfig(
+                task_type=TaskType.TOKEN_CLS, inference_mode=False, r=8, lora_alpha=8, lora_dropout=0.1, bias="all"
+            )
+            self.bert = get_peft_model(self.bert, peft_config)
+            self.bert.print_trainable_parameters()
         self.head = nn.Linear(self.bert.config.hidden_size, output_size)
         self.drop = nn.Dropout(0.2)
         self.lr = lr
         self.optimizer = optimizer
         self.loss_function = loss_function
         self.scheduler = scheduler
-        self.random_refreeze = random_refreeze
+        self.freeze_all = freeze_all
         if freeze_bert: 
-            self.refreeze_bert(random_refreeze)
+            self.freeze_bert()
 
-    def refreeze_bert(self, random: bool = False):
-            
-        if random:
+    def freeze_bert(self):
+
+        if self.freeze_all:
             for parameter in self.bert.parameters():
                 parameter.requires_grad = False
-            self.to('cpu')
-            torch.cuda.empty_cache()
-            to_freeze = np.random.choice([-1] + list(range(len(self.bert.encoder.layer))), 4, replace=False)
-            for num_layer in to_freeze:
-                if num_layer == -1:
-                    for parameter in self.bert.embeddings.parameters():
-                        parameter.requires_grad = True
-                else:
-                    for parameter in self.bert.encoder.layer[num_layer].parameters():
-                        parameter.requires_grad = True
-            self.to('cuda')
-        else: 
+        else:
             for parameter in self.bert.embeddings.parameters():
                 parameter.requires_grad = False
             for parameter in self.bert.encoder.layer[0].parameters():
                 parameter.requires_grad = False
             for parameter in self.bert.encoder.layer[1].parameters():
                 parameter.requires_grad = False
-            for parameter in self.bert.encoder.layer[2].parameters():
-                parameter.requires_grad = False
+            #for parameter in self.bert.encoder.layer[2].parameters():
+            #    parameter.requires_grad = False
+            #for parameter in self.bert.encoder.layer[3].parameters():
+            #    parameter.requires_grad = False
 
-    def forward(self, input_ids, attention_mask):
-        bert_output = self.bert(input_ids, attention_mask=attention_mask)
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        bert_output = self.bert.base_model.forward(input_ids, 
+                                attention_mask=attention_mask, 
+                                **kwargs)
         dropped = self.drop(bert_output.last_hidden_state)
         output = self.head(dropped)
 
         return output
-    
-    def on_after_backward(self):
-        self.refreeze_bert(self.random_refreeze)
     
     def configure_optimizers(self):
         optimizer = self.optimizer(self.parameters(), lr=self.lr)
